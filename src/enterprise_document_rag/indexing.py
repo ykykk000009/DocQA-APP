@@ -199,17 +199,12 @@ class DocumentIndexer:
         chunks: tuple[Chunk, ...],
         indexed_texts: tuple[str, ...],
     ) -> None:
+        chunk_rows = []
+        fts_rows = []
         for index, chunk in enumerate(chunks):
             previous_id = chunk_ids[index - 1] if index > 0 else None
             next_id = chunk_ids[index + 1] if index < len(chunks) - 1 else None
-            self.connection.execute(
-                """
-                INSERT INTO chunks (
-                    id, document_version_id, chunk_index, text, page_no, section_path,
-                    bbox, token_count, text_hash, previous_chunk_id, next_chunk_id
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+            chunk_rows.append(
                 (
                     chunk_ids[index],
                     document_version_id,
@@ -222,15 +217,26 @@ class DocumentIndexer:
                     chunk.text_hash,
                     previous_id,
                     next_id,
-                ),
+                )
             )
-            self.connection.execute(
-                """
-                INSERT INTO chunks_fts (chunk_id, document_version_id, text)
-                VALUES (?, ?, ?)
-                """,
-                (chunk_ids[index], document_version_id, indexed_texts[index]),
+            fts_rows.append((chunk_ids[index], document_version_id, indexed_texts[index]))
+        self.connection.executemany(
+            """
+            INSERT INTO chunks (
+                id, document_version_id, chunk_index, text, page_no, section_path,
+                bbox, token_count, text_hash, previous_chunk_id, next_chunk_id
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            chunk_rows,
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO chunks_fts (chunk_id, document_version_id, text)
+            VALUES (?, ?, ?)
+            """,
+            fts_rows,
+        )
 
     def _embed_and_store_vectors(
         self,
@@ -275,21 +281,18 @@ class DocumentIndexer:
         return total
 
     def _insert_index_records(self, chunk_ids: list[str]) -> None:
-        for chunk_id in chunk_ids:
-            self.connection.execute(
-                """
-                INSERT INTO index_records (id, chunk_id, index_kind, external_id, index_version)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (str(uuid.uuid4()), chunk_id, "fts5", chunk_id, self.index_version_name),
-            )
-            self.connection.execute(
-                """
-                INSERT INTO index_records (id, chunk_id, index_kind, external_id, index_version)
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                (str(uuid.uuid4()), chunk_id, "qdrant_local", chunk_id, self.index_version_name),
-            )
+        records = [
+            (str(uuid.uuid4()), chunk_id, kind, chunk_id, self.index_version_name)
+            for chunk_id in chunk_ids
+            for kind in ("fts5", "qdrant_local")
+        ]
+        self.connection.executemany(
+            """
+            INSERT INTO index_records (id, chunk_id, index_kind, external_id, index_version)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            records,
+        )
 
     def _count_chunks(self, document_version_id: str) -> int:
         row = self.connection.execute(

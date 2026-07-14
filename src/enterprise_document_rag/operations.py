@@ -143,7 +143,6 @@ class IngestionService:
         self._index_version(path=path, version_id=version.id)
 
     def _index_version(self, *, path: Path, version_id: str) -> None:
-
         parsed = parse_document(
             path,
             ocr_enabled=self.settings.ocr_enabled,
