@@ -19,6 +19,14 @@ $env:TEMP = $PackageTemp
 $env:TMP = $PackageTemp
 $env:PYINSTALLER_CONFIG_DIR = $PyInstallerCache
 
+$ExistingUserData = Join-Path $AppDir "user-data"
+if (Test-Path $ExistingUserData) {
+    throw "user-data exists in the dist build directory. Back it up or move it to a separate installation before packaging."
+}
+if (Test-Path $AppDir) {
+    Remove-Item $AppDir -Recurse -Force
+}
+
 if (-not (Test-Path $Python)) {
     & $BootstrapPython -m venv $BuildVenv
 }
@@ -44,7 +52,7 @@ if (-not (Test-Path $Python)) {
     --collect-submodules onnxruntime `
     windows_launcher.py
 
-Copy-Item (Join-Path $PSScriptRoot "使用说明.txt") (Join-Path $AppDir "QUICK_START.txt") -Force
+Copy-Item (Join-Path $PSScriptRoot "QUICK_START.txt") (Join-Path $AppDir "QUICK_START.txt") -Force
 Copy-Item (Join-Path $PSScriptRoot "portable.mode") $AppDir -Force
 Copy-Item (Join-Path $ProjectRoot "README.md") $AppDir -Force
 
@@ -64,5 +72,14 @@ $ZipPath = Join-Path $DistRoot $ZipName
 if (Test-Path $ZipPath) {
     Remove-Item $ZipPath -Force
 }
+if (Test-Path (Join-Path $AppDir "user-data")) {
+    throw "user-data was found in the build output. Packaging stopped."
+}
 Compress-Archive -Path $AppDir -DestinationPath $ZipPath -CompressionLevel Optimal
+$Hash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
+Set-Content `
+    -LiteralPath (Join-Path $DistRoot "SHA256SUMS.txt") `
+    -Value "$Hash  $ZipName" `
+    -Encoding ASCII
 Write-Host "Build completed: $ZipPath"
+Write-Host "SHA-256: $Hash"
