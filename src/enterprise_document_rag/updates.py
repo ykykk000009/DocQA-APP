@@ -148,7 +148,6 @@ class UpdateService:
         self.state_path = self.updates_dir / "update-state.json"
         self._open = opener or urllib.request.urlopen
         self._now = now or (lambda: datetime.now(UTC))
-        executable_dir = Path(sys.executable).resolve().parent
         # Published releases use one full package. Prefer the legacy offline
         # asset when it exists, then fall back to the Transformers package.
         # This also lets older installations migrate to the current format.
@@ -370,7 +369,9 @@ class UpdateService:
             headers={"Accept": "text/html", "User-Agent": f"DocQA/{self.current_version}"},
         )
         try:
-            with self._open(request, timeout=self.settings.update_request_timeout_seconds) as response:
+            with self._open(
+                request, timeout=self.settings.update_request_timeout_seconds
+            ) as response:
                 final_url = str(response.geturl())
         except (urllib.error.URLError, TimeoutError, AttributeError) as exc:
             raise UpdateError("GitHub API 受限，且无法读取 Release 页面") from exc
@@ -426,7 +427,9 @@ class UpdateService:
             },
         )
         try:
-            with self._open(request, timeout=self.settings.update_request_timeout_seconds) as response:
+            with self._open(
+                request, timeout=self.settings.update_request_timeout_seconds
+            ) as response:
                 response.read(1)
             return True
         except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError):

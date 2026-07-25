@@ -1,3 +1,5 @@
+import os
+import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,6 +13,7 @@ from . import __version__
 from .config import Settings, configure_huggingface_cache, get_settings
 from .db import initialize_sqlite, sqlite_connection, sqlite_health
 from .embeddings import build_embedding_provider
+from .intent_router import IntentKind, IntentRouter
 from .model_manager import QwenModelManager
 from .operations import IngestionService
 from .preview import render_document_preview
@@ -97,8 +100,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         initialize_sqlite(app_settings)
-        with sqlite_connection(app_settings) as connection:
-            JobRepository(connection).release_leases()
+        # The Windows launcher sets this only after the previous instance has
+        # stopped (or a stale instance record has been verified).  This avoids
+        # stealing a live worker's lease while still recovering immediately
+        # after a crash or upgrade takeover.
+        if os.environ.pop("DOCQA_RECOVER_LEASES", "") == "1":
+            with sqlite_connection(app_settings) as connection:
+                JobRepository(connection).release_leases(force=True)
         app.state.qwen_model_manager.start_auto_download()
         if (
             app_settings.llm_preload
@@ -142,9 +150,23 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def live() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.post("/internal/desktop/stop")
+    def stop_desktop_service(token: str = Query(..., min_length=1)) -> dict[str, str]:
+        """Allow a new launcher instance to hand off from an old local service."""
+        expected_token = os.environ.get("DOCQA_DESKTOP_CONTROL_TOKEN")
+        if not expected_token or not secrets.compare_digest(token, expected_token):
+            raise HTTPException(status_code=404, detail="not found")
+        callback = app.state.shutdown_callback
+        if callback is None:
+            raise HTTPException(status_code=409, detail="desktop shutdown is unavailable")
+        callback()
+        return {"status": "shutting_down"}
+
     @app.get("/health/ready")
     def ready() -> dict[str, bool | str]:
-        initialize_sqlite(app_settings)
+        # Schema setup is performed once during the application lifespan.
+        # Keeping readiness read-only avoids turning routine health probes into
+        # competing SQLite writers while ingestion is running.
         return sqlite_health(app_settings)
 
     @app.get("/api/v1/models/qwen3/status")
@@ -485,11 +507,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.post("/api/v1/query")
     def query(request: QueryRequest) -> dict[str, object]:
+        question = sanitize_unicode(request.question)
+        # One router instance is shared by the availability gate and the
+        # answerer.  This keeps rule and semantic fallback decisions
+        # consistent, including when the answer-generation model is absent.
+        intent_router = IntentRouter(
+            embedding_provider=build_embedding_provider(app_settings)
+        )
+        route = intent_router.route(question)
         model_missing = (
             app_settings.llm_backend == "qwen_transformers"
             and not app.state.qwen_model_manager.is_ready()
         )
-        if model_missing:
+        # File-location questions are answered from the authorised document
+        # catalogue and do not require the local generation model.
+        if model_missing and route.intent is not IntentKind.FILE_LOCATION:
             raise HTTPException(
                 status_code=409,
                 detail=(
@@ -505,9 +537,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     connection=connection,
                     retriever=retriever,
                     llm_provider=app.state.llm_provider,
+                    intent_router=intent_router,
                 ).answer(
                     knowledge_base_id=request.knowledge_base_id,
-                    question=sanitize_unicode(request.question),
+                    question=question,
                     allowed_document_ids=_allowed_document_ids(request.allowed_document_ids),
                 )
         finally:

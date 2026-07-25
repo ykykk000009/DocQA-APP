@@ -1,9 +1,19 @@
 import sqlite3
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import TypeVar
 
 from .config import Settings
+
+# SQLite permits many readers but only one writer.  A short bounded wait makes
+# routine hand-offs between the API process and the ingestion worker reliable
+# without hiding a genuinely stuck writer forever.
+SQLITE_BUSY_TIMEOUT_MS = 15_000
+SQLITE_LOCK_RETRY_DELAYS_SECONDS = (0.05, 0.15, 0.35)
+
+_T = TypeVar("_T")
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS app_metadata (
@@ -161,25 +171,93 @@ CREATE INDEX IF NOT EXISTS idx_jobs_state
 """
 
 
+def _is_locked_error(error: sqlite3.OperationalError) -> bool:
+    """Return whether SQLite rejected an operation because another writer owns it."""
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(error_code, int) and error_code & 0xFF in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    message = str(error).lower()
+    return "database is locked" in message or "database schema is locked" in message
+
+
+def _retry_locked(operation: Callable[[], _T]) -> _T:
+    """Retry only operations SQLite confirms were blocked before they ran."""
+    for delay in SQLITE_LOCK_RETRY_DELAYS_SECONDS:
+        try:
+            return operation()
+        except sqlite3.OperationalError as error:
+            if not _is_locked_error(error):
+                raise
+            time.sleep(delay)
+    return operation()
+
+
+class _ResilientSQLiteConnection(sqlite3.Connection):
+    """Connection with bounded retries for single SQL statements and commits.
+
+    Retrying ``executemany`` generically is unsafe because a batch can be partly
+    applied before an error.  It still benefits from SQLite's busy timeout.
+    """
+
+    def execute(self, sql: str, parameters: object = ()) -> sqlite3.Cursor:
+        return _retry_locked(
+            lambda: sqlite3.Connection.execute(self, sql, parameters)  # type: ignore[arg-type]
+        )
+
+    def commit(self) -> None:
+        _retry_locked(lambda: sqlite3.Connection.commit(self))
+
+
 def _connect(path: Path) -> sqlite3.Connection:
     if path != Path(":memory:"):
         path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(
+        path,
+        timeout=SQLITE_BUSY_TIMEOUT_MS / 1000,
+        factory=_ResilientSQLiteConnection,
+    )
     connection.row_factory = sqlite3.Row
+    # These are connection-local.  Configure them as soon as the connection is
+    # opened so every API request and worker transaction gets the same policy.
+    connection.execute(f"PRAGMA busy_timeout={SQLITE_BUSY_TIMEOUT_MS}")
+    connection.execute("PRAGMA foreign_keys=ON")
     return connection
 
 
 def initialize_sqlite(settings: Settings) -> None:
     with sqlite_connection(settings) as connection:
-        connection.execute("PRAGMA journal_mode=WAL;")
-        connection.execute("PRAGMA foreign_keys=ON;")
-        connection.executescript(SCHEMA_SQL)
-        _upgrade_pdf_metadata_schema(connection)
-        connection.execute(
-            "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?, ?)",
-            ("schema_version", "pdf-intelligence-v1"),
-        )
-        connection.commit()
+        _ensure_wal_mode(connection, database_path=settings.database_path)
+
+        def initialize() -> None:
+            connection.executescript(SCHEMA_SQL)
+            _upgrade_pdf_metadata_schema(connection)
+            connection.execute(
+                "INSERT OR REPLACE INTO app_metadata (key, value) VALUES (?, ?)",
+                ("schema_version", "pdf-intelligence-v1"),
+            )
+            connection.commit()
+
+        try:
+            _retry_locked(initialize)
+        except Exception:
+            # End a failed startup transaction promptly; otherwise a new
+            # process can inherit the appearance of a persistent writer lock.
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+
+def _ensure_wal_mode(connection: sqlite3.Connection, *, database_path: Path) -> None:
+    """Enable WAL once for file-backed databases instead of rewriting it on every boot."""
+    if database_path == Path(":memory:"):
+        return
+    row = connection.execute("PRAGMA journal_mode").fetchone()
+    journal_mode = str(row[0]).lower() if row is not None else ""
+    if journal_mode != "wal":
+        connection.execute("PRAGMA journal_mode=WAL").fetchone()
 
 
 def _upgrade_pdf_metadata_schema(connection: sqlite3.Connection) -> None:
@@ -217,9 +295,13 @@ def _upgrade_pdf_metadata_schema(connection: sqlite3.Connection) -> None:
 def sqlite_connection(settings: Settings) -> Iterator[sqlite3.Connection]:
     connection = _connect(settings.database_path)
     try:
-        connection.execute("PRAGMA foreign_keys=ON;")
         yield connection
     finally:
+        # Repositories commit their short write units themselves.  Roll back
+        # anything accidentally left open before closing so it cannot hold a
+        # write lock longer than the request/worker operation that created it.
+        if connection.in_transaction:
+            connection.rollback()
         connection.close()
 
 

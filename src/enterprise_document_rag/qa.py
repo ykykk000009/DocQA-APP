@@ -1,13 +1,18 @@
+import math
+import ntpath
 import re
 import sqlite3
 import subprocess
 import threading
+import unicodedata
 from dataclasses import dataclass, replace
+from difflib import SequenceMatcher
 from functools import lru_cache
 from pathlib import Path
 from typing import Protocol
 
 from .config import Settings
+from .intent_router import IntentKind, IntentRoute, IntentRouter
 from .retrieval import HybridRetriever, SearchResult, is_complex_query
 from .text_utils import clean_display_text, merge_context_texts
 
@@ -52,6 +57,287 @@ class ExtractiveLLMProvider:
         del question
         best = evidence[0]
         return f"{_first_sentence(best.quote)} [1]"
+
+
+# Only indexed document/archive suffixes count as an explicit filename
+# extension.  A generic ``.digits`` pattern mistakes titles such as
+# ``1.4可解释性`` and versioned names such as ``v2.0说明`` for filenames,
+# truncating the actual title before catalogue matching even begins.
+_INDEXED_FILE_EXTENSIONS = frozenset(
+    {
+        # Office / documents
+        "pdf",
+        "docx",
+        "doc",
+        "pptx",
+        "ppt",
+        "xlsx",
+        "xlsm",
+        "xls",
+        "odt",
+        "odp",
+        "ods",
+        "rtf",
+        # Text / markup
+        "txt",
+        "md",
+        "markdown",
+        "rst",
+        "tex",
+        # Structured data
+        "csv",
+        "tsv",
+        "json",
+        "jsonl",
+        "xml",
+        "yaml",
+        "yml",
+        # Archives
+        "zip",
+        "tar",
+        "gz",
+        "gzip",
+        "bz2",
+        "xz",
+        "rar",
+        "7z",
+        "tgz",
+    }
+)
+_INDEXED_EXTENSION_SUFFIXES = frozenset(f".{extension}" for extension in _INDEXED_FILE_EXTENSIONS)
+_FILENAME_PATTERN = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"([^\\/:*?\"<>|\s]+\.(?:"
+    + "|".join(_INDEXED_FILE_EXTENSIONS)
+    + r"))(?![A-Za-z0-9_.-])",
+    flags=re.IGNORECASE,
+)
+def is_file_location_question(question: str) -> bool:
+    """Whether a question asks for the location of a named document.
+
+    A filename extension is optional: people frequently omit ``.pdf`` or a
+    few descriptive words when asking where a document is stored.
+    """
+
+    return IntentRouter().route(question).intent is IntentKind.FILE_LOCATION
+
+
+def _filename_from_location_question(
+    question: str, *, route: IntentRoute | None = None
+) -> str | None:
+    route = route or IntentRouter().route(question)
+    if route.intent is not IntentKind.FILE_LOCATION:
+        return None
+    normalized = unicodedata.normalize("NFKC", question)
+    matches = _FILENAME_PATTERN.findall(normalized)
+    if matches:
+        # Prefer the longest candidate.  It prevents a short extension-like
+        # token in surrounding prose from winning over the requested filename.
+        return max(matches, key=len).strip("'\"“”‘’（）()[]【】")
+    return route.object_query or None
+
+
+def _normalized_filename(value: str) -> str:
+    """Compare filenames consistently across Windows/macOS/Linux spellings."""
+
+    base_name = ntpath.basename(value.replace("/", "\\"))
+    normalized = unicodedata.normalize("NFKC", base_name).casefold()
+    return re.sub(r"[\s_\-\u200b]+", "", normalized)
+
+
+def _filename_title_and_extension(value: str) -> tuple[str, str]:
+    """Return a comparison title and final extension for a filename query."""
+
+    normalized = _normalized_filename(value)
+    title, extension = ntpath.splitext(normalized)
+    # ``splitext`` regards any final dot as a suffix, including a title such
+    # as ``1.4可解释性``.  File identifiers only have an explicit extension
+    # when that suffix is actually one the application can index.
+    if extension in _INDEXED_EXTENSION_SUFFIXES:
+        return title, extension
+    return normalized, ""
+
+
+def _title_similarity(requested_title: str, candidate_title: str) -> float:
+    """Score abbreviated file titles without treating topical similarity as identity.
+
+    Chinese filenames often have no word separators, so a user may omit an
+    adjective in the middle of a title (``转行攻略`` vs ``转行最全攻略``).
+    SequenceMatcher handles that deletion; containment earns a stronger score
+    when the user's title is a literal subsequence of a longer catalogue title.
+    """
+
+    if not requested_title or not candidate_title:
+        return 0.0
+    if requested_title == candidate_title:
+        return 1.0
+    sequence_score = SequenceMatcher(None, requested_title, candidate_title).ratio()
+    if requested_title in candidate_title:
+        coverage = len(requested_title) / len(candidate_title)
+        return max(sequence_score, 0.86 + min(0.12, coverage * 0.12))
+    if candidate_title in requested_title:
+        coverage = len(candidate_title) / len(requested_title)
+        return max(sequence_score, 0.80 + min(0.10, coverage * 0.10))
+    # Require a substantial ordered common sequence for a title abbreviation.
+    # This prevents a few shared popular words from being mistaken as a file
+    # identity merely because their embeddings are topically close.
+    longest = SequenceMatcher(None, requested_title, candidate_title).find_longest_match().size
+    if longest < max(4, min(len(requested_title), len(candidate_title)) // 2):
+        return min(sequence_score, 0.70)
+    return sequence_score
+
+
+def _active_document_file_candidates(
+    *,
+    connection: sqlite3.Connection,
+    knowledge_base_id: str,
+    allowed_document_ids: set[str] | None,
+) -> list[dict[str, str]]:
+    params: list[object] = [knowledge_base_id]
+    acl_clause = ""
+    if allowed_document_ids is not None:
+        if not allowed_document_ids:
+            return []
+        placeholders = ", ".join("?" for _ in allowed_document_ids)
+        acl_clause = f" AND documents.id IN ({placeholders})"
+        params.extend(sorted(allowed_document_ids))
+    rows = connection.execute(
+        f"""
+        SELECT documents.id AS document_id, documents.canonical_path
+        FROM documents
+        JOIN document_versions ON document_versions.id = documents.active_version_id
+        WHERE documents.knowledge_base_id = ?
+          AND documents.visibility_state = 'visible'
+          AND document_versions.state = 'ready'
+          {acl_clause}
+        ORDER BY documents.canonical_path COLLATE NOCASE
+        """,
+        params,
+    ).fetchall()
+    return [
+        {
+            "document_id": str(row["document_id"]),
+            "canonical_path": str(row["canonical_path"]),
+            "file_name": ntpath.basename(str(row["canonical_path"]).replace("/", "\\")),
+        }
+        for row in rows
+    ]
+
+
+def _semantic_filename_match(
+    *,
+    requested_name: str,
+    candidates: list[dict[str, str]],
+    embedding_provider: object | None,
+) -> dict[str, str] | None:
+    """Return one conservative fuzzy/semantic filename match, if unambiguous."""
+
+    if not candidates:
+        return None
+    requested_normalized = _normalized_filename(requested_name)
+    requested_stem, requested_extension = _filename_title_and_extension(requested_name)
+    semantic_scores = [0.0] * len(candidates)
+    # Filename-only embeddings add recall for meaningful names such as Chinese
+    # titles while SequenceMatcher handles extensions, IDs and punctuation.
+    # Failure to load/use an embedding provider must never make lookup fail.
+    if embedding_provider is not None and len(candidates) <= 200:
+        try:
+            labels = [requested_name, *(item["file_name"] for item in candidates)]
+            vectors = embedding_provider.embed_texts(labels)  # type: ignore[attr-defined]
+            if len(vectors) == len(labels):
+                semantic_scores = [
+                    _cosine_similarity(vectors[0], vector) for vector in vectors[1:]
+                ]
+        except Exception:
+            pass
+    ranked: list[tuple[float, dict[str, str]]] = []
+    for index, candidate in enumerate(candidates):
+        candidate_normalized = _normalized_filename(candidate["file_name"])
+        candidate_stem, candidate_extension = _filename_title_and_extension(candidate["file_name"])
+        whole_ratio = SequenceMatcher(None, requested_normalized, candidate_normalized).ratio()
+        title_ratio = _title_similarity(requested_stem, candidate_stem)
+        # An explicitly supplied extension is part of the identifier.  Do not
+        # silently turn ``report.pdf`` into ``report.docx`` just because their
+        # names are similar.  When the user omits it, the title alone is used.
+        extension_matches = not requested_extension or requested_extension == candidate_extension
+        extension_bonus = 0.06 if requested_extension and extension_matches else 0.0
+        lexical_score = min(1.0, max(title_ratio + extension_bonus, whole_ratio))
+        if requested_extension and not extension_matches:
+            lexical_score = min(lexical_score, 0.70)
+        # Identifiers should stay conservative: semantic embeddings may find a
+        # topical but differently named document, which is not a file match.
+        score = max(lexical_score, 0.65 * lexical_score + 0.35 * semantic_scores[index])
+        if requested_extension and not extension_matches:
+            score = min(score, 0.70)
+        ranked.append((score, candidate))
+    ranked.sort(key=lambda item: (-item[0], item[1]["canonical_path"]))
+    best_score, best = ranked[0]
+    # The same filename can legitimately be indexed from more than one
+    # authorized folder.  Those entries are one logical match group, not
+    # competing guesses.  Only a differently named file may make an
+    # abbreviated title ambiguous.
+    best_file_name = _normalized_filename(best["file_name"])
+    runner_up_score = next(
+        (
+            score
+            for score, candidate in ranked[1:]
+            if _normalized_filename(candidate["file_name"]) != best_file_name
+        ),
+        0.0,
+    )
+    # Partial titles have no extension to disambiguate them, so accept them
+    # only with both a stronger score and a clearer lead over the runner-up.
+    required_score = 0.78 if requested_extension else 0.84
+    required_margin = 0.06 if requested_extension else 0.08
+    if best_score < required_score or best_score - runner_up_score < required_margin:
+        return None
+    return best
+
+
+def _cosine_similarity(left: object, right: object) -> float:
+    try:
+        left_values = [float(value) for value in left]  # type: ignore[union-attr]
+        right_values = [float(value) for value in right]  # type: ignore[union-attr]
+    except (TypeError, ValueError):
+        return 0.0
+    if len(left_values) != len(right_values) or not left_values:
+        return 0.0
+    denominator = math.sqrt(sum(value * value for value in left_values)) * math.sqrt(
+        sum(value * value for value in right_values)
+    )
+    if denominator == 0:
+        return 0.0
+    return (
+        sum(left * right for left, right in zip(left_values, right_values, strict=True))
+        / denominator
+    )
+
+
+def _file_location_citation(
+    *, connection: sqlite3.Connection, candidate: dict[str, str], citation_id: int
+) -> Citation:
+    row = connection.execute(
+        """
+        SELECT chunks.id, chunks.page_no, chunks.section_path
+        FROM chunks
+        JOIN documents ON documents.active_version_id = chunks.document_version_id
+        WHERE documents.id = ?
+        ORDER BY chunks.chunk_index
+        LIMIT 1
+        """,
+        (candidate["document_id"],),
+    ).fetchone()
+    return Citation(
+        citation_id=citation_id,
+        document_id=candidate["document_id"],
+        file_name=candidate["file_name"],
+        canonical_path=candidate["canonical_path"],
+        page_no=int(row["page_no"]) if row is not None and row["page_no"] is not None else None,
+        section_path=str(row["section_path"]) if row is not None and row["section_path"] else None,
+        quote=f"文件路径：{candidate['canonical_path']}",
+        chunk_id=str(row["id"]) if row is not None else "",
+        bbox=None,
+    )
 
 
 class LocalQwenProvider:
@@ -371,6 +657,7 @@ class RAGAnswerer:
         connection: sqlite3.Connection,
         retriever: HybridRetriever,
         llm_provider: LLMProvider | None = None,
+        intent_router: IntentRouter | None = None,
         final_top_k: int = 6,
         context_radius: int = 2,
     ) -> None:
@@ -379,6 +666,9 @@ class RAGAnswerer:
         self.connection = connection
         self.retriever = retriever
         self.llm_provider = llm_provider or ExtractiveLLMProvider()
+        self.intent_router = intent_router or IntentRouter(
+            embedding_provider=getattr(retriever, "embedding_provider", None)
+        )
         self.final_top_k = final_top_k
         self.context_radius = context_radius
 
@@ -389,6 +679,20 @@ class RAGAnswerer:
         question: str,
         allowed_document_ids: set[str] | None = None,
     ) -> Answer:
+        route = self.intent_router.route(question)
+        if route.intent is IntentKind.FILE_LOCATION:
+            # A file-location request is an inventory query, not a question
+            # that needs the language model.  Resolve it from the authorised
+            # document catalogue before retrieval so a filename which is not
+            # mentioned in its contents remains findable.
+            file_location_answer = self._answer_file_location(
+                knowledge_base_id=knowledge_base_id,
+                question=question,
+                route=route,
+                allowed_document_ids=allowed_document_ids,
+            )
+            if file_location_answer is not None:
+                return file_location_answer
         evidence = _select_answer_evidence(
             self.retriever.search(
                 knowledge_base_id=knowledge_base_id,
@@ -426,6 +730,41 @@ class RAGAnswerer:
             for index, result in enumerate(evidence, start=1)
         )
         self._validate_citations(knowledge_base_id=knowledge_base_id, citations=citations)
+        direct_section_evidence = _primary_question_section_evidence(
+            question=question,
+            evidence=evidence,
+        )
+        semantic_section_route = False
+        if not direct_section_evidence:
+            direct_section_evidence = _semantic_question_section_evidence(
+                question=question,
+                evidence=evidence,
+                embedding_provider=getattr(self.retriever, "embedding_provider", None),
+            )
+            semantic_section_route = bool(direct_section_evidence)
+        full_section_evidence = self._full_text_evidence(direct_section_evidence)
+        section_answer = _direct_section_answer(
+            question=question,
+            evidence=full_section_evidence,
+            semantic_route=semantic_section_route,
+        )
+        if section_answer is not None:
+            # A broad query can retrieve another, similarly named question.
+            # The answer above is deliberately restored from the best matching
+            # section only, so do not show the unrelated retrieval as support.
+            selected = direct_section_evidence[0]
+            selected_index = evidence.index(selected)
+            return Answer(
+                answer=_format_answer_citations(
+                    _complete_answer_sentences(
+                        answer=section_answer,
+                        evidence=full_section_evidence,
+                    )
+                ),
+                confidence="medium",
+                insufficient_evidence=False,
+                citations=(citations[selected_index],),
+            )
         generation_evidence = _expand_answer_evidence_compact(
             connection=self.connection,
             knowledge_base_id=knowledge_base_id,
@@ -480,9 +819,94 @@ class RAGAnswerer:
             answer=audited_answer,
             evidence=generation_evidence,
         )
+        verified_answer = _complete_answer_sentences(
+            answer=verified_answer,
+            evidence=generation_evidence,
+        )
+        verified_answer = _format_answer_citations(verified_answer)
         return Answer(
             answer=verified_answer,
             confidence="medium" if len(citations) == 1 else "high",
+            insufficient_evidence=False,
+            citations=citations,
+        )
+
+    def _answer_file_location(
+        self,
+        *,
+        knowledge_base_id: str,
+        question: str,
+        route: IntentRoute | None = None,
+        allowed_document_ids: set[str] | None,
+    ) -> Answer | None:
+        requested_name = _filename_from_location_question(question, route=route)
+        if requested_name is None:
+            return None
+
+        candidates = _active_document_file_candidates(
+            connection=self.connection,
+            knowledge_base_id=knowledge_base_id,
+            allowed_document_ids=allowed_document_ids,
+        )
+        exact_matches = [
+            candidate
+            for candidate in candidates
+            if _normalized_filename(candidate["file_name"])
+            == _normalized_filename(requested_name)
+        ]
+        matches = exact_matches
+        confidence = "high"
+        if not matches:
+            # Only fall back after exact filename matching fails.  The fallback
+            # is deliberately catalogue-only: it cannot reveal files outside
+            # the current knowledge base or the caller's document allow-list.
+            fuzzy_match = _semantic_filename_match(
+                requested_name=requested_name,
+                candidates=candidates,
+                embedding_provider=getattr(self.retriever, "embedding_provider", None),
+            )
+            if fuzzy_match is not None:
+                # A logical filename may be present in several authorized
+                # folders.  Once its abbreviated title has been resolved,
+                # return every same-name path rather than making the user
+                # choose blindly or treating the duplicates as a mismatch.
+                matched_file_name = _normalized_filename(fuzzy_match["file_name"])
+                matches = [
+                    candidate
+                    for candidate in candidates
+                    if _normalized_filename(candidate["file_name"]) == matched_file_name
+                ]
+                confidence = "medium"
+        if not matches:
+            return Answer(
+                answer=f"在已授权且已索引的资料中未找到文件“{requested_name}”。",
+                confidence="low",
+                insufficient_evidence=True,
+                citations=(),
+            )
+
+        citations = tuple(
+            _file_location_citation(
+                connection=self.connection,
+                candidate=candidate,
+                citation_id=index,
+            )
+            for index, candidate in enumerate(matches, start=1)
+        )
+        # A ready document normally has chunks.  Keep the path result useful
+        # for a just-indexed empty document too, but only validate citations
+        # that have a concrete indexed chunk.
+        self._validate_citations(
+            knowledge_base_id=knowledge_base_id,
+            citations=tuple(citation for citation in citations if citation.chunk_id),
+        )
+        lines = [
+            f"文件“{candidate['file_name']}”位于：{candidate['canonical_path']}。 [{index}]"
+            for index, candidate in enumerate(matches, start=1)
+        ]
+        return Answer(
+            answer="\n".join(lines),
+            confidence=confidence,
             insufficient_evidence=False,
             citations=citations,
         )
@@ -522,10 +946,60 @@ class RAGAnswerer:
             if row is None:
                 raise ValueError(f"invalid or unauthorized citation: {citation.chunk_id}")
 
+    def _full_text_evidence(self, evidence: list[SearchResult]) -> list[SearchResult]:
+        """Restore the full matched section for the extractive answer path."""
+        restored: list[SearchResult] = []
+        for item in evidence:
+            row = self.connection.execute(
+                """
+                SELECT document_version_id, chunk_index, section_path, text
+                FROM chunks
+                WHERE id = ?
+                """,
+                (item.chunk_id,),
+            ).fetchone()
+            if row is None:
+                restored.append(item)
+                continue
+            question_id = _question_identifier(
+                heading=str(row["text"]), section_path=str(row["section_path"] or "")
+            )
+            if question_id is not None:
+                continuation_rows = self.connection.execute(
+                    """
+                    SELECT chunk_index, section_path, text
+                    FROM chunks
+                    WHERE document_version_id = ?
+                        AND chunk_index >= ?
+                    ORDER BY chunk_index
+                    LIMIT 16
+                    """,
+                    (row["document_version_id"], row["chunk_index"]),
+                ).fetchall()
+                section_texts: list[str] = []
+                for candidate in continuation_rows:
+                    if (
+                        candidate["chunk_index"] != row["chunk_index"]
+                        and _starts_next_question(
+                            question_id=question_id,
+                            text=str(candidate["text"]),
+                            section_path=str(candidate["section_path"] or ""),
+                        )
+                    ):
+                        break
+                    section_texts.append(str(candidate["text"]))
+                source_text = "\n\n".join(section_texts)
+            else:
+                source_text = str(row["text"])
+            restored.append(replace(item, quote=source_text))
+        return restored
+
 
 def _first_sentence(text: str) -> str:
     normalized = " ".join(text.split())
-    parts = re.split(r"(?<=[。.!?])\s+", normalized, maxsplit=1)
+    # PDF text often has no whitespace after Chinese full stops, so requiring
+    # whitespace makes a "brief" bullet excerpt consume several sentences.
+    parts = re.split(r"(?<=[。！？.!?])", normalized, maxsplit=1)
     return _short_quote(parts[0])
 
 
@@ -702,24 +1176,53 @@ def _audit_answer_completeness(
     outlines = [
         (citation_id, outline)
         for citation_id, item in enumerate(evidence, start=1)
-        if (outline := _numbered_outline(item.quote))
+        if len(outline := _collection_evidence_items(item.quote)) >= 2
     ]
     if not outlines or not _is_collection_question(question):
         return answer
     citation_id, outline = max(outlines, key=lambda item: len(item[1]))
     normalized_answer = re.sub(r"\s+", "", answer)
     missing = [
-        title
-        for _, title in outline
-        if re.sub(r"\s+", "", title) not in normalized_answer
+        item for item in outline if not _collection_item_is_covered(item, normalized_answer)
     ]
     if not missing:
         return answer
-    items = "；".join(f"{number}. {title}" for number, title in outline)
+    items = "\n".join(f"- {item}" for item in outline)
     return (
-        f"\u4f9d\u636e\u539f\u6587\uff0c\u5171\u6709 {len(outline)} "
-        f"\u9879\uff1a{items}\u3002[{citation_id}]"
+        f"\u4f9d\u636e\u539f\u6587\uff0c\u5171\u6709 {len(outline)} \u9879\uff1a\n"
+        f"{items} [{citation_id}]"
     )
+
+
+def _collection_evidence_items(text: str) -> list[str]:
+    """Extract numbered or bullet-point facts for list-question completeness."""
+    numbered = _numbered_outline(text)
+    if len(numbered) >= 2:
+        return [f"{number}. {title}" for number, title in numbered]
+
+    bullet_pattern = re.compile(
+        r"(?ms)^\s*[•●▪◦\uf06c\uf0b7\uf0bc*\-]\s*([^\n:：]{2,120})[：:]\s*"
+        r"(.*?)(?=^\s*[•●▪◦\uf06c\uf0b7\uf0bc*\-]\s*[^\n:：]{2,120}[：:]|\Z)"
+    )
+    items: list[str] = []
+    for title, detail in bullet_pattern.findall(text):
+        title = clean_display_text(title).strip()
+        detail = clean_display_text(detail).strip()
+        if not title or not detail:
+            continue
+        excerpt = _first_sentence(detail).strip()
+        if not excerpt:
+            continue
+        item = f"{title}：{_short_quote(excerpt, max_chars=220)}"
+        if item not in items:
+            items.append(item)
+    return items
+
+
+def _collection_item_is_covered(item: str, normalized_answer: str) -> bool:
+    title = item.split("：", maxsplit=1)[0].split(":", maxsplit=1)[0]
+    normalized_title = re.sub(r"\s+", "", title)
+    return len(normalized_title) >= 2 and normalized_title in normalized_answer
 
 
 def _verify_answer_against_evidence(
@@ -765,6 +1268,110 @@ def _verify_answer_against_evidence(
     if not verified or not _answer_covers_question(question=question, answer=verified):
         return _grounded_fallback_answer(question=question, evidence=evidence)
     return verified
+
+
+def _complete_answer_sentences(*, answer: str, evidence: list[SearchResult]) -> str:
+    """Repair a dangling answer sentence only from the retrieved evidence.
+
+    Extractive and small-model paths occasionally emit a clause ending in a
+    functional word such as ``的。`` even when the continuation is present in
+    the source.  Reconstruct that sentence from evidence first.  If the source
+    itself is irretrievably fragmentary, return a complete conservative
+    sentence rather than presenting the user with a misleading half-sentence.
+    """
+    completed: list[str] = []
+    for claim in _answer_claims(answer):
+        clean_claim = re.sub(r"\s*\[\d+\]", "", claim).strip()
+        citations = "".join(dict.fromkeys(re.findall(r"\[(\d+)\]", claim)))
+        citation_text = "".join(f"[{citation}]" for citation in citations)
+        if not _has_dangling_sentence_ending(clean_claim):
+            completed.append(claim)
+            continue
+        recovered = _recover_complete_evidence_sentence(
+            fragment=clean_claim,
+            evidence=evidence,
+        )
+        if recovered is not None:
+            completed.append(f"{recovered}{citation_text or ' [1]'}")
+            continue
+        completed.append(
+            f"原文中的相关片段不完整，无法在不补充事实的前提下可靠还原。"
+            f"{citation_text or ' [1]'}"
+        )
+    return "\n".join(completed).strip()
+
+
+def _format_answer_citations(answer: str) -> str:
+    """Keep citations inline and avoid repeating one source for every line."""
+
+    formatted_lines: list[str] = []
+    for raw_line in answer.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        detached = re.fullmatch(r"(?:\[\d+\]\s*)+", line)
+        if detached is not None and formatted_lines:
+            formatted_lines[-1] = f"{formatted_lines[-1].rstrip()} {line}"
+            continue
+        formatted_lines.append(line)
+    formatted = "\n".join(formatted_lines)
+    citation_ids = re.findall(r"\[(\d+)\]", formatted)
+    if len(set(citation_ids)) == 1:
+        citation_id = citation_ids[0]
+        # One evidence block supports this whole answer. Retain a single,
+        # inline source marker instead of repeating it after every PDF line.
+        without_repetitions = re.sub(r"\s*\[\d+\]", "", formatted).strip()
+        return f"{without_repetitions} [{citation_id}]"
+    return re.sub(r"(\[\d+\])(?:\s*\1)+", r"\1", formatted)
+
+
+def _has_dangling_sentence_ending(text: str) -> bool:
+    if not text or not re.search(r"[\u4e00-\u9fff]", text):
+        return False
+    stripped = text.rstrip("。！？!?；;").rstrip()
+    return bool(stripped) and stripped.endswith(
+        (
+            "的",
+            "地",
+            "得",
+            "和",
+            "与",
+            "及",
+            "或",
+            "在",
+            "对",
+            "从",
+            "把",
+            "将",
+            "为",
+            "由",
+            "等",
+            "并",
+            "而",
+            "但",
+        )
+    )
+
+
+def _recover_complete_evidence_sentence(
+    *, fragment: str, evidence: list[SearchResult]
+) -> str | None:
+    needle = re.sub(r"\s+", "", fragment).rstrip("。！？!?；;")
+    if len(needle) < 8:
+        return None
+    for item in evidence:
+        source = re.sub(r"\s+", "", clean_display_text(item.quote))
+        offset = source.find(needle)
+        if offset < 0:
+            continue
+        tail = source[offset:]
+        terminal = re.search(r"[。！？!?；;]", tail)
+        if terminal is None:
+            continue
+        candidate = tail[: terminal.end()].strip()
+        if len(candidate) >= len(needle) + 1:
+            return candidate
+    return None
 
 
 def _answer_claims(answer: str) -> list[str]:
@@ -862,6 +1469,317 @@ def _direct_source_answer(
     if not merged or len(merged) > 900:
         return None
     return f"{merged} [1]"
+
+
+def _primary_question_section_evidence(
+    *, question: str, evidence: list[SearchResult]
+) -> list[SearchResult]:
+    """Choose the highest-ranked result whose heading is the asked question.
+
+    Search intentionally keeps close matches to improve recall.  For a
+    self-contained interview/FAQ section, however, combining two sections
+    with the same keywords can truncate or mix their answers.  Retrieval is
+    already ranked, so the first heading match is the authoritative section;
+    its continuation is expanded locally by ``_full_text_evidence``.
+    """
+    for item in evidence:
+        source_text = clean_display_text(item.quote)
+        heading = next(
+            (line.strip() for line in source_text.splitlines() if line.strip()),
+            "",
+        )
+        # Some interview-bank headings are declarative (for example,
+        # "Q6、估算一个星巴克门店的销售额") and have no question mark or
+        # interrogative word.  A direct title match is sufficient there.
+        if _question_heading_matches(heading, question) and (
+            _looks_like_question_heading(heading)
+            or _question_identifier(heading=heading, section_path=item.section_path or "")
+            is not None
+        ):
+            return [item]
+    return []
+
+
+def _semantic_question_section_evidence(
+    *, question: str, evidence: list[SearchResult], embedding_provider
+) -> list[SearchResult]:
+    """Route a paraphrased question to a retrieved document question title.
+
+    This is deliberately a fallback after literal/title normalization.  It
+    compares the user question against *question headings*, rather than against
+    arbitrary answer sentences, so a high score selects an entire coherent
+    section instead of a plausible-looking fragment.  Lexical entity overlap
+    and a confidence margin prevent a broad semantic match from hijacking a
+    different question.
+    """
+    candidates: list[tuple[SearchResult, str]] = []
+    seen: set[tuple[str, str]] = set()
+    for item in evidence:
+        heading = _question_heading_for_result(item)
+        if not heading:
+            continue
+        key = (item.document_id, heading)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append((item, heading))
+    if not candidates:
+        return []
+
+    if embedding_provider is None:
+        return []
+    try:
+        vectors = embedding_provider.embed_texts(
+            [question, *(heading for _, heading in candidates)]
+        )
+    except (AttributeError, RuntimeError, TypeError, ValueError):
+        return []
+    if len(vectors) != len(candidates) + 1:
+        return []
+
+    question_terms = _content_terms(_canonical_question_text(question))
+    question_intent = _question_intent_family(question)
+    scored: list[tuple[float, float, int, SearchResult]] = []
+    for (item, heading), vector in zip(candidates, vectors[1:], strict=True):
+        heading_intent = _question_intent_family(heading)
+        if (
+            question_intent is not None
+            and heading_intent is not None
+            and question_intent != heading_intent
+        ):
+            continue
+        similarity = _cosine_similarity(vectors[0], vector)
+        heading_terms = _content_terms(_canonical_question_text(heading))
+        shared_terms = len(question_terms & heading_terms)
+        coverage = shared_terms / max(1, min(len(question_terms), len(heading_terms)))
+        # The small retrieval-score tie-breaker preserves the retriever's
+        # ranking when duplicate documents carry the same interview question.
+        score = similarity * 0.78 + coverage * 0.20 + min(item.score, 5.0) * 0.004
+        scored.append((score, similarity, shared_terms, item))
+    if not scored:
+        return []
+    scored.sort(key=lambda item: item[0], reverse=True)
+    best_score, best_similarity, best_shared_terms, best_item = scored[0]
+    second_score = scored[1][0] if len(scored) > 1 else -1.0
+    best_heading_terms = _content_terms(
+        _canonical_question_text(_question_heading_for_result(best_item) or "")
+    )
+    title_coverage = best_shared_terms / max(1, min(len(question_terms), len(best_heading_terms)))
+    has_entity_support = best_shared_terms >= 2 and best_similarity >= 0.42
+    has_strong_title_overlap = best_shared_terms >= 3 and title_coverage >= 0.75
+    has_strong_semantic_support = best_similarity >= 0.78 and best_score - second_score >= 0.06
+    if not has_entity_support and not has_strong_title_overlap and not has_strong_semantic_support:
+        return []
+    return [best_item]
+
+
+def _question_heading_for_result(item: SearchResult) -> str | None:
+    source_text = clean_display_text(item.quote)
+    first_line = next(
+        (line.strip() for line in source_text.splitlines() if line.strip()),
+        "",
+    )
+    path_parts = [part.strip() for part in (item.section_path or "").split("/") if part.strip()]
+    for candidate in (first_line, *reversed(path_parts)):
+        if _question_identifier(heading=candidate, section_path=candidate) is not None:
+            return candidate
+        if _looks_like_question_heading(candidate):
+            return candidate
+    return None
+
+
+def _cosine_similarity(first: list[float], second: list[float]) -> float:
+    if len(first) != len(second) or not first:
+        return 0.0
+    numerator = sum(left * right for left, right in zip(first, second, strict=True))
+    first_norm = math.sqrt(sum(value * value for value in first))
+    second_norm = math.sqrt(sum(value * value for value in second))
+    if first_norm == 0 or second_norm == 0:
+        return 0.0
+    return numerator / (first_norm * second_norm)
+
+
+def _question_intent_family(text: str) -> str | None:
+    normalized = _canonical_question_text(text)
+    if any(
+        marker in normalized
+        for marker in ("计算", "统计", "估算", "测算", "求", "sql", "查询", "好评率", "比例")
+    ):
+        return "calculation"
+    if any(
+        marker in normalized
+        for marker in ("是什么", "什么是", "含义", "定义", "介绍", "原理", "区别", "原因")
+    ):
+        return "explanation"
+    if any(
+        marker in normalized
+        for marker in ("使用", "应用", "实现", "步骤", "流程", "配置", "安装")
+    ):
+        return "procedure"
+    return None
+
+
+def _direct_section_answer(
+    *, question: str, evidence: list[SearchResult], semantic_route: bool = False
+) -> str | None:
+    """Use a self-contained question-and-answer section without paraphrasing it.
+
+    Small local models can turn several faithful source sentences into an
+    unsupported causal relationship.  For FAQ, interview-bank and manual
+    sections whose heading directly matches the user's question, the source
+    paragraphs are already a coherent answer and are safer than regeneration.
+    """
+    if len(evidence) != 1:
+        return None
+    source_text = clean_display_text(evidence[0].quote)
+    paragraphs = [
+        clean_display_text(paragraph).strip()
+        for paragraph in re.split(r"\n\s*\n", source_text)
+        if clean_display_text(paragraph).strip()
+    ]
+    is_numbered_question = (
+        _question_identifier(heading=paragraphs[0], section_path="") is not None
+        if paragraphs
+        else False
+    )
+    if (
+        len(paragraphs) < 2
+        or not (semantic_route or _question_heading_matches(paragraphs[0], question))
+        or not (
+            semantic_route
+            or _looks_like_question_heading(paragraphs[0])
+            or is_numbered_question
+        )
+    ):
+        return None
+
+    answer_paragraphs: list[str] = []
+    structured_list_active = False
+    for paragraph in paragraphs[1:]:
+        # Example-code introductions are not an explanation by themselves;
+        # stop before them rather than returning an incomplete code preamble.
+        if re.search(r"(?:示例代码|example code|code example)", paragraph, re.IGNORECASE):
+            break
+        # A short line can be an essential list item in an estimation,
+        # checklist, or step-by-step answer (for example, "忙时供给").
+        # Do not discard it just because it is short; only suppress genuine
+        # page/header artefacts.
+        if _is_layout_noise_line(paragraph):
+            continue
+        if re.match(r"^\s*(?:\d+\s*[、.．)）]|[-*•])", paragraph):
+            structured_list_active = True
+        # PDF layout extraction often represents every visual line as a
+        # paragraph. Rejoin wrapped lines until a sentence is complete so the
+        # extractive answer reads as prose rather than a sequence of fragments.
+        if (
+            answer_paragraphs
+            and not _ends_source_sentence(answer_paragraphs[-1])
+            and not structured_list_active
+        ):
+            answer_paragraphs[-1] = f"{answer_paragraphs[-1]}{paragraph}"
+        else:
+            answer_paragraphs.append(paragraph)
+        if sum(len(item) for item in answer_paragraphs) >= 3_000:
+            break
+    if not answer_paragraphs:
+        return None
+    # The section is one continuous source block.  One inline marker at the
+    # end is sufficient and prevents a citation after every PDF layout line.
+    return "\n".join(answer_paragraphs) + " [1]"
+
+
+def _ends_source_sentence(text: str) -> bool:
+    return text.rstrip().endswith(("。", "！", "？", ".", "!", "?", ":", "："))
+
+
+def _is_layout_noise_line(text: str) -> bool:
+    normalized = " ".join(text.split())
+    return bool(
+        re.fullmatch(r"(?:第\s*\d+\s*页|\d{1,4}|[-—_]{3,}|[•·▪□■]+)", normalized)
+    )
+
+
+def _question_heading_matches(heading: str, question: str) -> bool:
+    normalized_heading = _canonical_question_text(heading)
+    normalized_question = _canonical_question_text(question)
+    return (
+        (
+            len(normalized_heading) >= 8
+            and normalized_heading in normalized_question
+        )
+        or (
+            len(normalized_question) >= 8
+            and normalized_question in normalized_heading
+        )
+    )
+
+
+def _canonical_question_text(value: str) -> str:
+    """Normalize a question title and natural-language paraphrases alike.
+
+    Knowledge bases commonly title a section as ``Q18 计算…`` while users ask
+    ``怎么计算…`` or ``计算…的方法``.  These additions express the requested
+    operation, not a different topic.  Removing only the stable interrogative
+    wrappers lets title matching use the same semantic core without weakening
+    retrieval for unrelated questions.
+    """
+    normalized = re.sub(
+        r"^\s*(?:q\s*)?\d{1,3}(?:\s*[.、．:：)）]\s*|\s+)",
+        "",
+        value,
+        flags=re.I,
+    )
+    normalized = re.sub(r"\s+", "", normalized).casefold()
+    normalized = normalized.strip("?？。.!！：:")
+    normalized = re.sub(
+        r"^(?:请问|请教|麻烦|能不能|能否|可以|可否|如何去|怎么去|怎样去|"
+        r"如何来|怎么来|怎样来|如何|怎么|怎样|咋)+",
+        "",
+        normalized,
+    )
+    normalized = re.sub(
+        r"(?:的方法|的方式|的步骤|怎么做|如何做|怎样做|怎么计算|如何计算|"
+        r"怎样计算|怎么操作|如何操作|怎样操作|呢|吗|呀|么)+$",
+        "",
+        normalized,
+    )
+    return normalized.strip("?？。.!！：:")
+
+
+def _looks_like_question_heading(heading: str) -> bool:
+    return "?" in heading or "？" in heading or any(
+        marker in heading
+        for marker in ("如何", "什么", "哪些", "哪几", "为什么", "是否", "怎么")
+    )
+
+
+def _question_identifier(*, heading: str, section_path: str) -> tuple[str, int] | None:
+    combined = f"{heading}\n{section_path}"
+    matched = re.search(r"(?i)\bQ\s*(\d{1,3})\b", combined)
+    if matched:
+        return ("q", int(matched.group(1)))
+    candidates = [heading.splitlines()[0] if heading.splitlines() else ""]
+    candidates.extend(part.strip() for part in section_path.split("/") if part.strip())
+    for candidate in candidates:
+        matched = re.match(r"\s*(\d{1,3})\s*[、.．]", candidate)
+        if matched:
+            return ("number", int(matched.group(1)))
+    return None
+
+
+def _starts_next_question(
+    *, question_id: tuple[str, int], text: str, section_path: str
+) -> bool:
+    candidate = _question_identifier(heading=text, section_path=section_path)
+    if candidate is None:
+        return False
+    kind, number = question_id
+    candidate_kind, candidate_number = candidate
+    if kind == "q":
+        return candidate_kind == "q" and candidate_number != number
+    # Numbered Q&A banks often use 1./2. as answer subheadings. Only the
+    # following top-level number starts the next question.
+    return candidate_kind == "number" and candidate_number == number + 1
 
 
 def _is_collection_question(question: str) -> bool:
@@ -1360,6 +2278,7 @@ def _excel_calculated_value(*, label: str, text: str) -> str | None:
         text,
     )
     return match.group(1) if match else None
+
 
 
 def _content_terms(text: str) -> set[str]:

@@ -160,7 +160,7 @@ class DocumentIndexer:
                 self.connection.execute(
                     """
                     UPDATE document_versions
-                    SET state = 'ready', updated_at = CURRENT_TIMESTAMP
+                    SET state = 'ready', error = NULL, updated_at = CURRENT_TIMESTAMP
                     WHERE id = ?
                     """,
                     (version_id,),

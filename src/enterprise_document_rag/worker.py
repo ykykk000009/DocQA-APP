@@ -66,6 +66,8 @@ class IngestionWorker:
     def _process_one_job(self) -> bool:
         with sqlite_connection(self.settings) as connection:
             jobs = JobRepository(connection)
+            # Only expired (or legacy expiry-less) leases are recoverable.  A
+            # second process must never steal work from a still-running worker.
             jobs.release_leases()
             runnable = jobs.list_runnable()
             if not runnable:

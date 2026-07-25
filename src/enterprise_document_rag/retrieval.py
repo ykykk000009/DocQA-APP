@@ -106,29 +106,30 @@ class HybridRetriever:
             query=query,
             allowed_document_ids=allowed_document_ids,
         )
-        if exact_ranked:
-            fts_ranked = exact_ranked
-            contains_ranked = exact_ranked
-            vector_ranked = []
-        else:
-            fts_ranked = self._fts_search(
-                knowledge_base_id=knowledge_base_id,
-                query=query,
-                allowed_document_ids=allowed_document_ids,
-            )
-            contains_ranked = self._contains_search(
-                knowledge_base_id=knowledge_base_id,
-                query=query,
-                allowed_document_ids=allowed_document_ids,
-            )
-            vector_ranked = self._vector_search(
-                knowledge_base_id=knowledge_base_id,
-                query=query,
-                allowed_document_ids=allowed_document_ids,
-            )
+        # A literal hit can be the question itself in interview banks, FAQs and
+        # training material.  It is useful evidence, but it must not suppress
+        # semantic retrieval of the following answer or a differently worded
+        # answer elsewhere in the same document.  Fuse every retrieval channel
+        # instead of treating an exact hit as a terminal result.
+        fts_ranked = self._fts_search(
+            knowledge_base_id=knowledge_base_id,
+            query=query,
+            allowed_document_ids=allowed_document_ids,
+        )
+        contains_ranked = self._contains_search(
+            knowledge_base_id=knowledge_base_id,
+            query=query,
+            allowed_document_ids=allowed_document_ids,
+        )
+        vector_ranked = self._vector_search(
+            knowledge_base_id=knowledge_base_id,
+            query=query,
+            allowed_document_ids=allowed_document_ids,
+        )
         fused_scores: dict[str, float] = {}
         sources: dict[str, set[str]] = {}
         for source_name, ranked_ids in [
+            ("exact", exact_ranked),
             ("fts", fts_ranked),
             ("contains", contains_ranked),
             ("vector", vector_ranked),
@@ -214,6 +215,7 @@ class HybridRetriever:
                 chunk_id: fused_scores[chunk_id]
                 + _lexical_overlap_score(query, by_id[chunk_id]["text"])
                 + _structure_relevance_bonus(query, by_id[chunk_id])
+                - _question_prompt_penalty(query=query, text=str(by_id[chunk_id]["text"]))
                 for chunk_id in available_ids
             }
         rerank_scores = self.reranker.score(
@@ -229,6 +231,7 @@ class HybridRetriever:
                 + _exact_field_bonus(query, by_id[chunk_id]["text"])
                 + _table_total_bonus(query, by_id[chunk_id]["text"])
                 + _structure_relevance_bonus(query, by_id[chunk_id])
+                - _question_prompt_penalty(query=query, text=str(by_id[chunk_id]["text"]))
             )
             for chunk_id, rerank_score in zip(available_ids, rerank_scores, strict=True)
         }
@@ -696,6 +699,64 @@ def _focused_quote(*, text: str, query: str, max_chars: int = 900) -> str:
 def _lexical_overlap_score(query: str, text: str) -> float:
     normalized = " ".join(text.split())
     return sum(weight for term, weight in _contains_terms(query) if term in normalized)
+
+
+def _question_prompt_penalty(*, query: str, text: str) -> float:
+    """Avoid treating a copied question stem as the answer to that question.
+
+    Interview banks and FAQs commonly contain a short annotation such as
+    "this question assesses …" before a separate, fuller answer.  Exact
+    matching rightly retrieves that annotation, but its full question overlap
+    otherwise overwhelms the answer block during ranking.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if len(lines) < 2 or not _same_question_stem(lines[0], query):
+        return 0.0
+    annotation = " ".join(lines[1:4]).casefold()
+    prompt_cues = (
+        "这个问题",
+        "本题",
+        "考察",
+        "题目涉及",
+        "题目关注",
+        "请介绍",
+        "请说明",
+        "请阐述",
+        "this question",
+        "the question",
+        "assesses",
+    )
+    answer_cues = (
+        "答案",
+        "答：",
+        "解答",
+        "包括以下",
+        "主要包括",
+        "具体如下",
+        "可以分为",
+        "answer:",
+    )
+    if any(cue in annotation for cue in prompt_cues) and not any(
+        cue in annotation for cue in answer_cues
+    ):
+        return 200.0
+    return 0.0
+
+
+def _same_question_stem(left: str, right: str) -> bool:
+    def normalize(value: str) -> str:
+        value = re.sub(r"^\s*\d{1,3}\s*[.、:：)]\s*", "", value)
+        value = re.sub(r"\s+", "", value).casefold()
+        return value.rstrip("?？。.!！")
+
+    normalized_left = normalize(left)
+    normalized_right = normalize(right)
+    return (
+        len(normalized_left) >= 8
+        and normalized_left in normalized_right
+        or len(normalized_right) >= 8
+        and normalized_right in normalized_left
+    )
 
 
 def _exact_field_bonus(query: str, text: str) -> float:

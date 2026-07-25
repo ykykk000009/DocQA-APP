@@ -322,13 +322,19 @@ def _pdf_image_regions(
     except (AttributeError, RuntimeError, TypeError, ValueError):
         image_info = ()
     table_boxes = [block.bbox for block in table_blocks if block.bbox is not None]
+    page_rect = pymupdf.Rect(page.rect)
     regions: list[tuple[float, float, float, float]] = []
     for info in image_info:
         bbox = _float_bbox(info.get("bbox") if isinstance(info, dict) else None)
         if bbox is None:
             continue
-        if bbox[2] - bbox[0] < 8 or bbox[3] - bbox[1] < 8:
+        # PDFs can retain placement records for images outside the visible page.
+        # Rendering one of those records produces a zero-height pixmap, which
+        # MuPDF cannot serialize as PNG ("Invalid bandwriter header").
+        clipped = pymupdf.Rect(bbox) & page_rect
+        if clipped.is_empty or clipped.width < 8 or clipped.height < 8:
             continue
+        bbox = (float(clipped.x0), float(clipped.y0), float(clipped.x1), float(clipped.y1))
         if any(_bbox_overlap_ratio(bbox, table_bbox) >= 0.5 for table_bbox in table_boxes):
             continue
         regions.append(bbox)
@@ -464,13 +470,18 @@ def _extract_pdf_image_blocks(
     image_blocks: list[ParsedBlock] = []
     for region in regions:
         try:
+            clip = pymupdf.Rect(region) & page.rect
+            if clip.is_empty or clip.width < 1 or clip.height < 1:
+                continue
             pixmap = page.get_pixmap(
                 matrix=pymupdf.Matrix(2, 2),
-                clip=pymupdf.Rect(region),
+                clip=clip,
                 alpha=False,
             )
+            if pixmap.width < 1 or pixmap.height < 1:
+                continue
             image_bytes = pixmap.tobytes("png")
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except (OSError, RuntimeError, TypeError, ValueError, pymupdf.mupdf.FzErrorBase):
             continue
         if not image_bytes:
             continue
@@ -885,7 +896,9 @@ def _extract_pdf_table_blocks(*, page, page_no: int) -> list[ParsedBlock]:
             except (AttributeError, RuntimeError, TypeError, ValueError):
                 continue
             normalized_rows = _normalize_table_rows(rows)
-            if not _is_usable_table(normalized_rows):
+            if not _is_usable_table(normalized_rows) or _looks_like_code_grid(
+                normalized_rows
+            ):
                 continue
             if options and len(normalized_rows[0]) < 3:
                 # Text-only inference is intentionally conservative: two-column
@@ -907,6 +920,40 @@ def _extract_pdf_table_blocks(*, page, page_no: int) -> list[ParsedBlock]:
         if extracted:
             break
     return extracted
+
+
+def _looks_like_code_grid(rows: tuple[tuple[str, ...], ...]) -> bool:
+    """Reject code listings that ``find_tables`` split into word cells.
+
+    PDF table detection can mistake a monospaced SQL/Python screenshot (or
+    native code box) for a dense borderless table.  Indexing its individual
+    words as Markdown cells destroys the program and also suppresses the
+    original layout block.  Let the normal text/OCR path handle such regions.
+    """
+    joined = " ".join(cell for row in rows for cell in row if cell).casefold()
+    if not joined:
+        return False
+    sql_keywords = re.findall(
+        r"\b(?:select|from|join|where|group|order|having|case|when|then|else|end|"
+        r"count|sum|avg|insert|update|delete|with|union)\b",
+        joined,
+    )
+    programming_markers = sum(
+        marker in joined
+        for marker in ("=>", "def ", "import ", "return ", "function ", "console.")
+    )
+    narrow_cells = sum(
+        1
+        for row in rows
+        for cell in row
+        if cell and len(cell.strip()) <= 3
+    )
+    populated_cells = sum(1 for row in rows for cell in row if cell)
+    return (
+        len(set(sql_keywords)) >= 3
+        or (len(sql_keywords) >= 4 and populated_cells >= 6)
+        or (programming_markers >= 2 and narrow_cells >= max(3, populated_cells // 3))
+    )
 
 
 def _normalize_table_rows(rows: Any) -> tuple[tuple[str, ...], ...]:

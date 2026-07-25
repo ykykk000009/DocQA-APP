@@ -630,14 +630,24 @@ class JobRepository:
         rows = self.connection.execute(sql, parameters).fetchall()
         return [_row_to_job(row) for row in rows]
 
-    def release_leases(self) -> int:
+    def release_leases(self, *, force: bool = False) -> int:
+        """Return only jobs that a stopped worker can no longer own.
+
+        Older installations did not set an expiry, so a NULL expiry is treated as
+        abandoned for one compatible upgrade cycle.  New leases always carry an
+        expiry and must not be stolen by another live worker.
+        """
+        reclaim_condition = "state = 'leased'"
+        if not force:
+            reclaim_condition += (
+                " AND (lease_expires_at IS NULL OR lease_expires_at <= CURRENT_TIMESTAMP)"
+            )
         cursor = self.connection.execute(
             """
             UPDATE jobs
             SET state = 'queued', lease_owner = NULL, lease_expires_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE state = 'leased'
-            """
+            WHERE """ + reclaim_condition,
         )
         self.connection.commit()
         return int(cursor.rowcount)
@@ -650,6 +660,7 @@ class JobRepository:
             """
             UPDATE jobs
             SET state = 'leased', attempts = attempts + 1, lease_owner = ?,
+                lease_expires_at = datetime('now', '+2 hours'),
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
             """,

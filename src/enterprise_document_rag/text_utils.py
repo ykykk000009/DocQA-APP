@@ -8,6 +8,10 @@ _METADATA_PREFIXES = (
     "\u538b\u7f29\u5305\u5185\u6587\u4ef6\uff1a",
 )
 
+# Common private-use glyphs emitted when a PDF uses Symbol/Wingdings-like
+# bullets. They have no reliable browser glyph and otherwise show as a box.
+_PRIVATE_BULLETS = frozenset({"\uf06c", "\uf0b7", "\uf0bc"})
+
 
 def sanitize_unicode(text: str) -> str:
     """Preserve valid Unicode while replacing malformed UTF-16 surrogates."""
@@ -37,11 +41,29 @@ def clean_display_text(text: str) -> str:
     """Remove retrieval-only metadata and repeated paragraphs from displayed text."""
     text = sanitize_unicode(text)
     lines = []
-    for line in text.splitlines():
+    source_lines = text.splitlines()
+    index = 0
+    while index < len(source_lines):
+        line = source_lines[index]
         stripped = line.strip()
         if any(stripped.startswith(prefix) for prefix in _METADATA_PREFIXES):
+            index += 1
+            continue
+        if stripped in _PRIVATE_BULLETS:
+            # PDF extraction often puts the bullet on its own visual line.
+            # Join it to the following content instead of displaying a missing
+            # private-use glyph as a small square.
+            next_index = index + 1
+            while next_index < len(source_lines) and not source_lines[next_index].strip():
+                next_index += 1
+            if next_index < len(source_lines):
+                lines.append(f"- {source_lines[next_index].strip()}")
+                index = next_index + 1
+                continue
+            index += 1
             continue
         lines.append(line.rstrip())
+        index += 1
     return _deduplicate_paragraphs("\n".join(lines))
 
 

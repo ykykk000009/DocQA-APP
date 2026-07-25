@@ -188,6 +188,13 @@
     dialog { width: min(460px, calc(100vw - 32px)); border: 1px solid var(--line); border-radius: 9px; color: var(--text); background: var(--surface); box-shadow: 0 20px 70px rgba(10, 25, 55, .28); padding: 22px; }
     dialog::backdrop { background: rgba(15, 29, 54, .35); backdrop-filter: blur(2px); }
     dialog h2 { margin: 0 0 12px; font-size: 18px; }
+    .update-version-grid { display: grid; grid-template-columns: auto 1fr; gap: 7px 18px; margin: 0 0 18px; font-size: 14px; }
+    .update-version-grid dt { color: var(--muted); }
+    .update-version-grid dd { margin: 0; font-weight: 750; }
+    .update-dialog-notes { margin: 0 0 20px; }
+    .update-dialog-notes strong { display: block; margin-bottom: 8px; }
+    .update-dialog-notes pre { max-height: min(42vh, 380px); margin: 0; overflow: auto; padding: 12px; border: 1px solid var(--line); border-radius: 7px; color: var(--text); background: var(--surface-soft); font: 13px/1.65 "Microsoft YaHei UI", "Segoe UI", sans-serif; white-space: pre-wrap; }
+    .update-dialog-actions { display: flex; justify-content: flex-end; gap: 10px; }
     dialog p { margin: 8px 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
     dialog form { display: flex; justify-content: flex-end; margin-top: 18px; }
     .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 16px 0; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
@@ -338,6 +345,21 @@
     </div>
     <div class="settings-actions"><button id="settings-close" class="button compact" type="button">关闭</button></div>
   </dialog>
+  <dialog id="update-dialog" aria-labelledby="update-dialog-title">
+    <h2 id="update-dialog-title">发现新版本</h2>
+    <dl class="update-version-grid">
+      <dt>当前版本：</dt><dd id="update-current-version"></dd>
+      <dt>最新版本：</dt><dd id="update-latest-version"></dd>
+    </dl>
+    <section class="update-dialog-notes" aria-label="更新内容">
+      <strong>更新内容：</strong>
+      <pre id="update-dialog-notes"></pre>
+    </section>
+    <div class="update-dialog-actions">
+      <button id="update-dialog-later" class="button secondary compact" type="button">稍后更新</button>
+      <button id="update-dialog-now" class="button compact" type="button">下载并安装</button>
+    </div>
+  </dialog>
 
   <script>
     const state = { knowledgeBases: [], selectedKnowledgeBaseId: "", toastTimer: null, refreshing: false, update: null, updatePollTimer: null, modelPollTimer: null, announcedVersion: "" };
@@ -402,6 +424,29 @@
       return labels[update.state] || `当前版本 v${update.current_version}`;
     }
 
+    function formatReleaseNotes(notes) {
+      const normalized = String(notes || "").replace(/\r\n/g, "\n").trim();
+      if (!normalized) return "本版本未提供更新说明。";
+      return normalized
+        .split("\n")
+        .map((line) => line.replace(/^\s{0,3}#{1,6}\s*/, "").replace(/^\s*[-*+]\s+/, "• "))
+        .join("\n");
+    }
+
+    function showUpdateDialog(update) {
+      if (!update?.latest_version) return;
+      byId("update-current-version").textContent = `v${update.current_version}`;
+      byId("update-latest-version").textContent = `v${update.latest_version}`;
+      byId("update-dialog-notes").textContent = formatReleaseNotes(update.release?.notes);
+      const button = byId("update-dialog-now");
+      button.textContent = update.state === "downloaded"
+        ? (update.install_supported ? "安装并重启" : "已完成下载")
+        : "下载并安装";
+      button.disabled = update.state === "downloading";
+      const dialog = byId("update-dialog");
+      if (!dialog.open) dialog.showModal();
+    }
+
     function renderUpdate(update) {
       state.update = update;
       if (update.recently_installed_version && state.announcedVersion !== update.recently_installed_version) {
@@ -414,7 +459,7 @@
       const visibleStates = new Set(["available", "downloading", "downloaded", "download_failed"]);
       banner.classList.toggle("visible", visibleStates.has(update.state));
       byId("update-title").textContent = updateStatusText(update);
-      byId("update-notes").textContent = update.release?.notes || "";
+      byId("update-notes").textContent = formatReleaseNotes(update.release?.notes);
       const downloading = update.state === "downloading";
       const progress = byId("update-progress");
       progress.hidden = !downloading;
@@ -901,6 +946,7 @@
           update = await refreshUpdateStatus();
         }
         if (update.state === "check_failed") showToast(update.error || "检查更新失败", true);
+        else if (["available", "deferred"].includes(update.state)) showUpdateDialog(update);
         else showToast(updateStatusText(update));
       } catch (error) { showToast(error.message, true); }
       finally { setBusy(button, false); }
@@ -916,8 +962,7 @@
         renderUpdate(await request("/api/v1/updates/skip", { method: "POST", body: JSON.stringify({ version: state.update.latest_version }) }));
       } catch (error) { showToast(error.message, true); }
     };
-    byId("update-now").onclick = async () => {
-      const button = byId("update-now");
+    async function downloadOrInstallUpdate(button) {
       try {
         if (state.update?.state !== "downloaded") {
           renderUpdate(await request("/api/v1/updates/download", { method: "POST" }));
@@ -931,6 +976,17 @@
         await request("/api/v1/updates/install", { method: "POST" });
         showToast("正在退出旧版本并安装更新");
       } catch (error) { showToast(error.message, true); setBusy(button, false); }
+    }
+    byId("update-now").onclick = () => downloadOrInstallUpdate(byId("update-now"));
+    byId("update-dialog-now").onclick = async () => {
+      byId("update-dialog").close();
+      await downloadOrInstallUpdate(byId("update-dialog-now"));
+    };
+    byId("update-dialog-later").onclick = async () => {
+      try {
+        renderUpdate(await request("/api/v1/updates/remind-later", { method: "POST" }));
+        byId("update-dialog").close();
+      } catch (error) { showToast(error.message, true); }
     };
     byId("theme-button").onclick = () => {
       const root = document.documentElement;
