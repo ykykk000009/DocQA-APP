@@ -1,9 +1,27 @@
+import json
 import os
+import sys
 from functools import lru_cache
 from pathlib import Path
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+def _bundled_update_manifest_url() -> str:
+    """Read the OSS update endpoint baked into a Windows package, if any."""
+    configured = os.environ.get("UPDATE_MANIFEST_URL", "").strip()
+    if configured:
+        return configured
+    if not getattr(sys, "frozen", False):
+        return ""
+    metadata_path = Path(sys.executable).resolve().parent / "version.json"
+    try:
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return ""
+    value = metadata.get("update_manifest_url") if isinstance(metadata, dict) else ""
+    return str(value or "").strip()
 
 
 class Settings(BaseSettings):
@@ -65,6 +83,7 @@ class Settings(BaseSettings):
     graph_rag_enabled: bool = False
     app_data_dir: Path | None = None
     update_enabled: bool = True
+    update_manifest_url: str = Field(default_factory=_bundled_update_manifest_url)
     update_repository: str = "ykykk000009/DocQA-APP"
     update_check_interval_hours: int = Field(default=24, ge=1, le=168)
     update_request_timeout_seconds: int = Field(default=15, ge=3, le=120)

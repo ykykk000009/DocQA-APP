@@ -1,4 +1,4 @@
-"""GitHub Release based application update checks and downloads."""
+"""Manifest-first application update checks and downloads."""
 
 from __future__ import annotations
 
@@ -28,6 +28,7 @@ _VERSION_RE = re.compile(
     r"(?:-(?P<prerelease>[0-9A-Za-z.-]+))?$"
 )
 _SHA256_RE = re.compile(r"\b([0-9a-fA-F]{64})\b")
+_MANIFEST_SCHEMA_VERSION = 1
 
 
 class UpdateError(RuntimeError):
@@ -133,6 +134,62 @@ def parse_release(payload: dict[str, Any], *, prefer_offline: bool = False) -> R
     )
 
 
+def parse_update_manifest(payload: dict[str, Any], *, prefer_offline: bool = False) -> ReleaseInfo:
+    """Parse an immutable-asset update manifest served from object storage."""
+    schema_version = payload.get("schema_version", _MANIFEST_SCHEMA_VERSION)
+    if schema_version != _MANIFEST_SCHEMA_VERSION:
+        raise UpdateError(f"不支持的更新清单版本：{schema_version}")
+    try:
+        version = normalize_version(str(payload.get("version") or ""))
+    except ValueError as exc:
+        raise UpdateError("更新清单中的版本号无效") from exc
+    assets = payload.get("assets")
+    if not isinstance(assets, list):
+        raise UpdateError("更新清单缺少 assets 列表")
+
+    expected_names = [f"DocQA-v{version}-win-x64.zip"]
+    if prefer_offline:
+        expected_names.insert(0, f"DocQA-v{version}-win-x64-offline.zip")
+    selected = next(
+        (
+            item
+            for name in expected_names
+            for item in assets
+            if isinstance(item, dict) and item.get("name") == name
+        ),
+        None,
+    )
+    if not isinstance(selected, dict):
+        raise UpdateError("更新清单没有可用的 Windows 更新包")
+
+    download_url = str(selected.get("url") or selected.get("download_url") or "").strip()
+    sha256 = str(selected.get("sha256") or "").strip().lower()
+    if not download_url:
+        raise UpdateError("更新清单中的下载地址无效")
+    if _SHA256_RE.fullmatch(sha256) is None:
+        raise UpdateError("更新清单中的 SHA-256 校验值无效")
+    try:
+        size = int(selected.get("size") or 0)
+    except (TypeError, ValueError) as exc:
+        raise UpdateError("更新清单中的安装包大小无效") from exc
+
+    asset = ReleaseAsset(
+        name=str(selected.get("name") or ""),
+        download_url=download_url,
+        size=max(0, size),
+        sha256=sha256,
+    )
+    return ReleaseInfo(
+        version=version,
+        tag_name=str(payload.get("tag_name") or f"v{version}"),
+        notes=str(payload.get("notes") or "").strip(),
+        html_url=str(payload.get("release_url") or payload.get("html_url") or "").strip(),
+        published_at=str(payload.get("published_at") or "").strip() or None,
+        asset=asset,
+        checksum_url=str(selected.get("sha256_url") or "").strip() or None,
+    )
+
+
 class UpdateService:
     def __init__(
         self,
@@ -143,6 +200,7 @@ class UpdateService:
     ) -> None:
         self.settings = settings
         self.current_version = normalize_version(__version__)
+        self.manifest_url = settings.update_manifest_url.strip()
         self.repository = settings.update_repository
         self.updates_dir = settings.application_data_path / "updates"
         self.state_path = self.updates_dir / "update-state.json"
@@ -162,6 +220,7 @@ class UpdateService:
         result.update(
             {
                 "current_version": self.current_version,
+                "manifest_url": self.manifest_url,
                 "repository": self.repository,
                 "enabled": self.settings.update_enabled,
                 "install_supported": bool(getattr(sys, "frozen", False)),
@@ -343,6 +402,45 @@ class UpdateService:
                 self._save_state()
 
     def _fetch_latest_release(self) -> ReleaseInfo:
+        manifest_error: UpdateError | None = None
+        if self.manifest_url:
+            try:
+                return self._fetch_update_manifest()
+            except UpdateError as exc:
+                manifest_error = exc
+        try:
+            return self._fetch_github_release()
+        except UpdateError as exc:
+            if manifest_error is not None:
+                raise UpdateError(
+                    f"OSS 更新源不可用（{manifest_error}）；GitHub 回退也不可用（{exc}）"
+                ) from exc
+            raise
+
+    def _fetch_update_manifest(self) -> ReleaseInfo:
+        request = urllib.request.Request(
+            self.manifest_url,
+            headers={
+                "Accept": "application/json",
+                "User-Agent": f"DocQA/{self.current_version}",
+            },
+        )
+        try:
+            with self._open(
+                request, timeout=self.settings.update_request_timeout_seconds
+            ) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise UpdateError(f"无法读取 OSS 更新清单（HTTP {exc.code}）") from exc
+        except (urllib.error.URLError, TimeoutError) as exc:
+            raise UpdateError("无法连接 OSS 更新清单") from exc
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise UpdateError("OSS 更新清单格式无效") from exc
+        if not isinstance(payload, dict):
+            raise UpdateError("OSS 更新清单不是 JSON 对象")
+        return parse_update_manifest(payload, prefer_offline=self.prefer_offline)
+
+    def _fetch_github_release(self) -> ReleaseInfo:
         url = f"https://api.github.com/repos/{self.repository}/releases/latest"
         request = self._request(url)
         try:

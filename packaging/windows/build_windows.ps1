@@ -4,6 +4,8 @@ param(
     [switch]$OnlineOnly,
     [switch]$OnlineModels,
     [switch]$OfflineOnly,
+    [string]$UpdateManifestUrl = $env:UPDATE_MANIFEST_URL,
+    [bool]$CreateLegacyOfflineAlias = $true,
     [string]$BootstrapPython = "python"
 )
 
@@ -119,7 +121,11 @@ function Write-VersionMetadata([string]$Edition) {
         qwen_download_url = "https://huggingface.co/Qwen/Qwen3-0.6B"
         chunking_rule_version = "token-aware-v1"
         vector_index_version = "v1"
-    } | ConvertTo-Json
+    }
+    if (-not [string]::IsNullOrWhiteSpace($UpdateManifestUrl)) {
+        $VersionMetadata.update_manifest_url = $UpdateManifestUrl.Trim()
+    }
+    $VersionMetadata = $VersionMetadata | ConvertTo-Json
     Set-Content -LiteralPath (Join-Path $AppDir "version.json") -Value $VersionMetadata -Encoding UTF8
 }
 
@@ -139,9 +145,23 @@ function Write-ZipPackage([string]$ZipName) {
     Write-Host "SHA-256: $Hash"
 }
 
+function Write-LegacyOfflineAlias {
+    if (-not $CreateLegacyOfflineAlias) {
+        return
+    }
+    $StandardName = "DocQA-v$Version-win-x64.zip"
+    $AliasName = "DocQA-v$Version-win-x64-offline.zip"
+    $StandardPath = Join-Path $DistRoot $StandardName
+    $AliasPath = Join-Path $DistRoot $AliasName
+    Copy-Item -LiteralPath $StandardPath -Destination $AliasPath -Force
+    $Hash = (Get-FileHash $AliasPath -Algorithm SHA256).Hash.ToLowerInvariant()
+    Set-Content -LiteralPath "$AliasPath.sha256" -Value "$Hash  $AliasName" -Encoding ASCII
+}
+
 if ($OnlineOnly) {
     Write-VersionMetadata "online"
     Write-ZipPackage "DocQA-v$Version-win-x64.zip"
+    Write-LegacyOfflineAlias
     exit 0
 }
 
@@ -164,6 +184,7 @@ if (-not $OfflineOnly) {
     Set-Content -LiteralPath (Join-Path $AppDir "online-models.mode") -Value "transformers" -Encoding ASCII
     Write-VersionMetadata "online-models"
     Write-ZipPackage "DocQA-v$Version-win-x64.zip"
+    Write-LegacyOfflineAlias
     exit 0
 }
 

@@ -36,6 +36,9 @@ dev = [
     "pytest>=7.4,<9.0",
     "ruff>=0.6,<1.0",
 ]
+release = [
+    "oss2>=2.19,<3.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
