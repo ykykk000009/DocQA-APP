@@ -1,0 +1,72 @@
+name: Publish release assets from OSS
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix (for example 0.3.7)
+        required: true
+        type: string
+      oss_base_url:
+        description: Public OSS prefix that contains immutable release assets
+        required: false
+        default: https://docqa-app.oss-cn-beijing.aliyuncs.com/docqa/releases
+        type: string
+      publish:
+        description: Publish the release after every asset has been verified
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download immutable packages from OSS
+        shell: bash
+        run: |
+          set -euo pipefail
+          version='${{ inputs.version }}'
+          base="${{ inputs.oss_base_url }}/v${version}"
+          manifest_url="${{ inputs.oss_base_url }}"
+          manifest_url="${manifest_url%/releases}/latest.json"
+          standard="DocQA-v${version}-win-x64.zip"
+          offline="DocQA-v${version}-win-x64-offline.zip"
+          curl --fail --location --retry 5 --retry-delay 3 --retry-all-errors \
+            --output latest.json "$manifest_url"
+
+          for asset in "$standard" "$offline"; do
+            curl --fail --location --retry 5 --retry-delay 3 --retry-all-errors \
+              --output "$asset" "$base/$asset"
+            expected="$(jq -r --arg asset "$asset" '.assets[] | select(.name == $asset) | .sha256' latest.json)"
+            test -n "$expected" && test "$expected" != "null"
+            actual="$(sha256sum "$asset" | awk '{print $1}')"
+            test "$actual" = "$expected"
+            printf '%s  %s\n' "$actual" "$asset" > "$asset.sha256"
+          done
+
+      - name: Create or update draft release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="v${{ inputs.version }}"
+          if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$tag" --repo "$GITHUB_REPOSITORY" --target main \
+              --title "DocQA $tag" --generate-notes --draft
+          fi
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" \
+            DocQA-v${{ inputs.version }}-win-x64.zip \
+            DocQA-v${{ inputs.version }}-win-x64.zip.sha256 \
+            DocQA-v${{ inputs.version }}-win-x64-offline.zip \
+            DocQA-v${{ inputs.version }}-win-x64-offline.zip.sha256 \
+            --clobber
+
+      - name: Publish verified release
+        if: ${{ inputs.publish }}
+        shell: bash
+        run: gh release edit "v${{ inputs.version }}" --repo "$GITHUB_REPOSITORY" --draft=false --latest
