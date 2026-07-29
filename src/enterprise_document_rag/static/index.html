@@ -195,6 +195,7 @@
     dialog p { margin: 8px 0; color: var(--muted); font-size: 14px; line-height: 1.65; }
     dialog form { display: flex; justify-content: flex-end; margin-top: 18px; }
     .settings-row { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin: 16px 0; padding: 12px 0; border-top: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+    .settings-update-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
     .settings-value { color: var(--muted); font-size: 13px; }
     .settings-actions { display: flex; justify-content: flex-end; gap: 10px; }
 
@@ -322,7 +323,10 @@
         <div class="result-title">软件更新</div>
         <div id="settings-update-status" class="settings-value">正在读取版本信息</div>
       </div>
-      <button id="check-update-button" class="button secondary compact" type="button">检查更新</button>
+      <div class="settings-update-actions">
+        <button id="install-update-button" class="button compact" type="button" hidden>安装并重启</button>
+        <button id="check-update-button" class="button secondary compact" type="button">检查更新</button>
+      </div>
     </div>
     <div class="settings-actions"><button id="settings-close" class="button compact" type="button">关闭</button></div>
   </dialog>
@@ -348,7 +352,7 @@
   </dialog>
 
   <script>
-    const state = { knowledgeBases: [], selectedKnowledgeBaseId: "", toastTimer: null, refreshing: false, update: null, updatePollTimer: null, modelPollTimer: null, announcedVersion: "", promptedUpdateVersion: "" };
+    const state = { knowledgeBases: [], selectedKnowledgeBaseId: "", toastTimer: null, refreshing: false, update: null, updatePollTimer: null, modelPollTimer: null, announcedVersion: "", promptedUpdateVersion: "", promptedDownloadedVersion: "" };
     const byId = (id) => document.getElementById(id);
     const selectedId = () => byId("knowledge-base-select").value;
     const patterns = (value) => value.split(";").map((item) => item.trim()).filter(Boolean);
@@ -455,11 +459,23 @@
         request("/api/v1/updates/acknowledge-install", { method: "POST" }).catch(() => {});
       }
       byId("settings-update-status").textContent = updateStatusText(update);
+      byId("install-update-button").hidden = !(
+        update.state === "downloaded" && update.install_supported
+      );
       const dialog = byId("update-dialog");
       if (dialog.open) showUpdateDialog(update, { force: true });
       if (update.state === "available" && state.promptedUpdateVersion !== update.latest_version) {
         state.promptedUpdateVersion = update.latest_version;
         showUpdateDialog(update);
+      }
+      if (
+        update.state === "downloaded"
+        && update.install_supported
+        && !byId("settings-dialog").open
+        && state.promptedDownloadedVersion !== update.latest_version
+      ) {
+        state.promptedDownloadedVersion = update.latest_version;
+        showUpdateDialog(update, { force: true });
       }
     }
 
@@ -932,7 +948,7 @@
           update = await refreshUpdateStatus();
         }
         if (update.state === "check_failed") showToast(update.error || "检查更新失败", true);
-        else if (["available", "deferred"].includes(update.state)) showUpdateDialog(update, { force: true });
+        else if (["available", "deferred", "downloaded"].includes(update.state)) showUpdateDialog(update, { force: true });
         else showToast(updateStatusText(update));
       } catch (error) { showToast(error.message, true); }
       finally { setBusy(button, false); }
@@ -942,6 +958,7 @@
       try {
         if (state.update?.state !== "downloaded") {
           renderUpdate(await request("/api/v1/updates/download", { method: "POST" }));
+          await refreshUpdateStatus();
           return;
         }
         if (!state.update.install_supported) {
@@ -955,6 +972,9 @@
     }
     byId("update-dialog-now").onclick = async () => {
       await downloadOrInstallUpdate(byId("update-dialog-now"));
+    };
+    byId("install-update-button").onclick = async () => {
+      await downloadOrInstallUpdate(byId("install-update-button"));
     };
     byId("update-dialog-later").onclick = async () => {
       try {

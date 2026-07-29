@@ -286,6 +286,10 @@ class UpdateService:
                 raise UpdateError("当前版本没有可下载的 Windows 更新包")
             if not is_newer_version(release.version, self.current_version):
                 raise UpdateError("当前已经是最新版本")
+            if self._has_verified_download(release):
+                self._restore_downloaded_state(release)
+                self._save_state()
+                return self.status()
             self._state.update(
                 {
                     "state": "downloading",
@@ -308,17 +312,25 @@ class UpdateService:
         try:
             release = self._fetch_latest_release()
             now = self._now().isoformat()
-            state = "up_to_date"
-            if is_newer_version(release.version, self.current_version):
-                state = (
-                    "skipped"
-                    if self._state.get("skipped_version") == release.version
-                    else "available"
-                )
-                remind_after = _parse_datetime(self._state.get("remind_after"))
-                if state == "available" and remind_after is not None and remind_after > self._now():
-                    state = "deferred"
             with self._lock:
+                has_download = self._has_verified_download(release)
+                state = "up_to_date"
+                if is_newer_version(release.version, self.current_version):
+                    if has_download:
+                        state = "downloaded"
+                    else:
+                        state = (
+                            "skipped"
+                            if self._state.get("skipped_version") == release.version
+                            else "available"
+                        )
+                        remind_after = _parse_datetime(self._state.get("remind_after"))
+                        if (
+                            state == "available"
+                            and remind_after is not None
+                            and remind_after > self._now()
+                        ):
+                            state = "deferred"
                 self._state.update(
                     {
                         "state": state,
@@ -328,6 +340,10 @@ class UpdateService:
                         "latest_version": release.version,
                     }
                 )
+                if has_download:
+                    self._restore_downloaded_state(release)
+                else:
+                    self._clear_download_state()
                 self._save_state()
         except Exception as exc:
             with self._lock:
@@ -339,6 +355,50 @@ class UpdateService:
                     }
                 )
                 self._save_state()
+
+    def _has_verified_download(self, release: ReleaseInfo) -> bool:
+        """Return whether the persisted package is the verified asset for *release*.
+
+        A check request must not downgrade a completed download back to
+        ``available``.  The persisted hash is written only after the download
+        stream has passed verification, so comparing it with the current
+        release manifest is enough to reuse the local package without hashing
+        a multi-gigabyte ZIP on every status check.
+        """
+        asset = release.asset
+        if asset is None or not asset.sha256:
+            return False
+        if str(self._state.get("sha256") or "").lower() != asset.sha256.lower():
+            return False
+        raw_path = str(self._state.get("download_path") or "").strip()
+        if not raw_path:
+            return False
+        try:
+            package = Path(raw_path).resolve(strict=True)
+            package.relative_to(self.updates_dir.resolve())
+        except (OSError, ValueError):
+            return False
+        if not package.is_file():
+            return False
+        return asset.size <= 0 or package.stat().st_size == asset.size
+
+    def _restore_downloaded_state(self, release: ReleaseInfo) -> None:
+        """Restore the UI-facing downloaded state from an already verified ZIP."""
+        package = Path(str(self._state["download_path"])).resolve()
+        size = package.stat().st_size
+        self._state.update(
+            {
+                "state": "downloaded",
+                "error": None,
+                "downloaded_bytes": size,
+                "total_bytes": size,
+                "sha256": release.asset.sha256 if release.asset else self._state.get("sha256"),
+            }
+        )
+
+    def _clear_download_state(self) -> None:
+        for key in ("download_path", "downloaded_bytes", "total_bytes", "sha256"):
+            self._state.pop(key, None)
 
     def _download_worker(self, release: ReleaseInfo) -> None:
         try:
@@ -364,9 +424,10 @@ class UpdateService:
             ) as response:
                 total = int(response.headers.get("Content-Length") or release.asset.size or 0)
                 downloaded = 0
+                last_progress_save = 0.0
                 with partial.open("wb") as output:
                     while True:
-                        block = response.read(1024 * 1024)
+                        block = response.read(128 * 1024)
                         if not block:
                             break
                         output.write(block)
@@ -376,7 +437,10 @@ class UpdateService:
                             self._state.update(
                                 {"downloaded_bytes": downloaded, "total_bytes": total}
                             )
-                            self._save_state()
+                            now = time.monotonic()
+                            if now - last_progress_save >= 0.5:
+                                self._save_state()
+                                last_progress_save = now
             actual = digest.hexdigest()
             if actual != expected_hashes[0]:
                 partial.unlink(missing_ok=True)
